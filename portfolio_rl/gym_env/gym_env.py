@@ -20,9 +20,10 @@ class PortfolioEnv(Env):
     def __init__(self, wallet: float = DEFAULT_WALLET):
         self.wallet = wallet
 
-    def reset(self, *,
-              seed: Optional[int] = None,
-              options: Dict[str, Any] = {}
+    def reset(
+        self, *,
+        seed: Optional[int] = None,
+        options: Dict[str, Any] = {}
     ) -> tuple[ObsType, Dict[str, Any]]:
         """Resets the environment to an initial internal state, returning an initial observation and info"""
         super().reset(seed=seed)
