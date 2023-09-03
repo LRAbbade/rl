@@ -1,4 +1,5 @@
-from typing import Optional, Dict, Any, Tuple, SupportsFloat
+from datetime import date
+from typing import Optional, Dict, Any, Tuple, SupportsFloat, Iterable
 
 from gymnasium import Env
 from gymnasium.spaces import Space
@@ -11,13 +12,57 @@ DEFAULT_WALLET = 1e6
 
 
 class PortfolioEnv(Env):
+    # TODO: make action_space and observation_space
     action_space: Space[ActType]
     observation_space: Space[ObsType]
     reward_range: Tuple[float, float] = -1, np.inf
     spec: EnvSpec | None = None
+    _last_date: date = None
+    _iterator: Iterable[date] = None
 
-    def __init__(self, wallet: float = DEFAULT_WALLET):
+    def __init__(self, data_path: str, warmup_data_path: Optional[str] = None, wallet: float = DEFAULT_WALLET, warmup: bool = False):
+        """
+        Portfolio Env constructor
+
+        Args:
+            data_path (str): A valid parquet file path with the S&P 500 portfolio data to be used,
+                should be in the shape `(N * 500, 11)`, where `N` is the number of days to be traded.
+                Each day should have the top 500 stocks in the index that day.
+            warmup_data_path (optional str): A parquet file path with warmup data to be given to the agent
+                before trading starts, this is usually to calculate things like moving averages
+            wallet (optional float): The size of the trading wallet, 1,000,000 by default
+            warmup (optional bool): Whether to pass the agent warmup data on `reset` call or not.
+                If `True`, then `warmup_data_path` must resolve to a valid parquet file
+        """
+        self.df = pd.read_parquet(data_path)
+        self._validate_data(self.df)
+        self.warmup = warmup
+        self.warmup_data_path = warmup_data_path
+        self._validate_warmup()
+        if self.warmup_data_path is not None:
+            self.warmup_df = pd.read_parquet(warmup_data_path)
+
         self.wallet = wallet
+
+    def _validate_data(self, df: pd.DataFrame):
+        aux = df.groupby('date').agg({'ticker': 'count'})
+        assert aux[aux['ticker'] != 500].empty, 'Every date of data should have exactly 500 rows (top 500 tickers)'
+
+    def _validate_warmup(self):
+        assert not self.warmup or self.warmup_data_path is not None, 'Need to specify warmup data path when using warmup = True'
+
+    def __iter__(self):
+        return iter(sorted(list(self.df['date'].unique())))
+
+    def __next__(self):
+        if self._iterator is None:
+            self._iterator = iter(self)
+
+        self._last_date = next(self._iterator)
+        return self.df.loc[self.df['date'] == self._last_date]
+
+    def _next_obs(self) -> ObsType:
+        return next(self)
 
     def reset(
         self, *,
@@ -41,7 +86,8 @@ class PortfolioEnv(Env):
                 Usually, you want to pass an integer *right after the environment has been initialized and then never again*.
                 Please refer to the minimal example above to see this paradigm in action.
             options (optional dict):
-                - wallet: wallet size in float (default: 1,000,000)
+                - wallet (float): wallet size (default: 1,000,000)
+                - warmup (bool): Whether to pass the agent warmup data on `reset` call or not (default: False)
 
         Returns:
             observation (ObsType): Observation of the initial state. This will be an element of :attr:`observation_space`
@@ -52,6 +98,17 @@ class PortfolioEnv(Env):
         super().reset(seed=seed)
         if 'wallet' in options:
             self.wallet = options['wallet']
+
+        if 'warmup' in options:
+            self.warmup = options['warmup']
+            self._validate_warmup()
+
+        self._iterator = None
+        obs = self._next_obs()
+        if self.warmup:
+            obs = pd.concat([self.warmup_df, obs]).reset_index(drop=True)
+
+        return obs, {}
 
     def step(
         self, action: ActType
@@ -65,16 +122,20 @@ class PortfolioEnv(Env):
             action (ActType): an action provided by the agent to update the environment state.
 
         Returns:
-            observation (ObsType): An element of the environment's :attr:`observation_space` as the next observation due to the agent actions.
-                An example is a numpy array containing the positions and velocities of the pole in CartPole.
-            reward (SupportsFloat): The reward as a result of taking the action.
-            terminated (bool): Whether the agent reaches the terminal state (as defined under the MDP of the task)
-                which can be positive or negative. An example is reaching the goal state or moving into the lava from
-                the Sutton and Barton, Gridworld. If true, the user needs to call :meth:`reset`.
-            truncated (bool): Whether the truncation condition outside the scope of the MDP is satisfied.
-                Typically, this is a timelimit, but could also be used to indicate an agent physically going out of bounds.
-                Can be used to end the episode prematurely before a terminal state is reached.
-                If true, the user needs to call :meth:`reset`.
+            observation (ObsType): A dataframe in the shape (500, 11) with the 500 top stocks of the S&P 500 on the day and market data on each
+            reward (SupportsFloat): The return of the portfolio on the day
+            terminated (bool): whether the trading period is over (env is finished)
+            truncated (bool): whether the agent wallet reached 0 (cumulative return over trading period is -100%)
             info (dict): Contains auxiliary diagnostic information (helpful for debugging, learning, and logging)
         """
-        pass
+        # TODO: handle action
+        obs = None
+        reward = 0 # portfolio daily return
+        terminated = False
+        truncated = self.wallet <= 0
+        try:
+            obs = self._next_obs()
+        except StopIteration:
+            terminated = True
+
+        return obs, reward, terminated, truncated, {}
