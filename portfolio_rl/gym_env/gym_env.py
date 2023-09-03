@@ -2,25 +2,65 @@ from datetime import date
 from typing import Optional, Dict, Any, Tuple, SupportsFloat, Iterable
 
 from gymnasium import Env
-from gymnasium.spaces import Space
+from gymnasium.spaces import Space, Box
 from gymnasium.core import ObsType, ActType
 from gymnasium.envs.registration import EnvSpec
+
 import numpy as np
+from numpy.typing import NDArray
 import pandas as pd
+from sklearn.preprocessing import normalize
 
 DEFAULT_WALLET = 1e6
 
 
+class NormBox(Box):
+    """A gym box space that returns normalized samples (ie. rows sum to 1)"""
+    def sample(self, equal_weight: bool = True) -> NDArray[Any]:
+        """
+        Returns an action space sample for the PortfolioEnv
+        
+        Args:
+            equal_weight (bool): Whether to return an equal weighted action
+                (ie, every stock will get the same weight) or a random weighted one
+        """
+        if not equal_weight:
+            samp = super().sample()
+            samp = normalize(samp, axis=1, norm='l1')
+        else:
+            samp = np.ones(self._shape) * (1 / self._shape[1])
+
+        return samp[0]
+
+
+class MarketObservation(Space):
+    def __init__(self, df: pd.DataFrame, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.df = df
+        self.dates = sorted(list(self.df['date'].unique()))
+
+    def sample(self, random: bool = True) -> pd.DataFrame:
+        if random:
+            pos = int(np.floor(self.np_random.random() * len(self.dates)))
+        else:
+            pos = 0
+
+        return self.df.loc[self.df['date'] == self.dates[pos]]
+
+
 class PortfolioEnv(Env):
-    # TODO: make action_space and observation_space
     action_space: Space[ActType]
     observation_space: Space[ObsType]
     reward_range: Tuple[float, float] = -1, np.inf
     spec: EnvSpec | None = None
     _last_date: date = None
+    _cur_date: date = None
     _iterator: Iterable[date] = None
 
-    def __init__(self, data_path: str, warmup_data_path: Optional[str] = None, wallet: float = DEFAULT_WALLET, warmup: bool = False):
+    def __init__(self,
+        data_path: str, warmup_data_path: Optional[str] = None, wallet: float = DEFAULT_WALLET,
+        warmup: bool = False, slippage: int = 10
+    ):
         """
         Portfolio Env constructor
 
@@ -33,6 +73,7 @@ class PortfolioEnv(Env):
             wallet (optional float): The size of the trading wallet, 1,000,000 by default
             warmup (optional bool): Whether to pass the agent warmup data on `reset` call or not.
                 If `True`, then `warmup_data_path` must resolve to a valid parquet file
+            slippage (optional int): how many bps of slippage to apply to each order (default 10 bps)
         """
         self.df = pd.read_parquet(data_path)
         self._validate_data(self.df)
@@ -43,6 +84,9 @@ class PortfolioEnv(Env):
             self.warmup_df = pd.read_parquet(warmup_data_path)
 
         self.wallet = wallet
+        self.slippage = slippage
+        self.action_space = NormBox(0, 1, [1, 500], np.float32)
+        self.observation_space = MarketObservation(self.df, shape=[500, 11])
 
     def _validate_data(self, df: pd.DataFrame):
         aux = df.groupby('date').agg({'ticker': 'count'})
@@ -58,8 +102,9 @@ class PortfolioEnv(Env):
         if self._iterator is None:
             self._iterator = iter(self)
 
-        self._last_date = next(self._iterator)
-        return self.df.loc[self.df['date'] == self._last_date]
+        self._last_date = self._cur_date
+        self._cur_date = next(self._iterator)
+        return self.df.loc[self.df['date'] == self._cur_date]
 
     def _next_obs(self) -> ObsType:
         return next(self)
@@ -88,6 +133,7 @@ class PortfolioEnv(Env):
             options (optional dict):
                 - wallet (float): wallet size (default: 1,000,000)
                 - warmup (bool): Whether to pass the agent warmup data on `reset` call or not (default: False)
+                - slippage (int): bps of slippage to be applied to each order
 
         Returns:
             observation (ObsType): Observation of the initial state. This will be an element of :attr:`observation_space`
@@ -103,6 +149,9 @@ class PortfolioEnv(Env):
             self.warmup = options['warmup']
             self._validate_warmup()
 
+        if 'slippage' in options:
+            self.slippage = options['slippage']
+
         self._iterator = None
         obs = self._next_obs()
         if self.warmup:
@@ -110,16 +159,25 @@ class PortfolioEnv(Env):
 
         return obs, {}
 
+    def _validate_action(self, action: ActType) -> NDArray[Any]:
+        arr = np.array(action)
+        assert arr.shape == (500,), f'action shape is {arr.shape}, should be (500,)'
+        assert np.isclose(arr.sum(), 1), f'portfolio weights should sum to 1, not {arr.sum()}'
+        return arr
+
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
-        """Run one timestep of the environment's dynamics using the agent actions.
+        """
+        Run one timestep of the environment's dynamics using the agent actions.
 
         When the end of an episode is reached (``terminated or truncated``), it is necessary to call :meth:`reset` to
         reset this environment's state for the next episode.
 
         Args:
-            action (ActType): an action provided by the agent to update the environment state.
+            action (ActType): A list of 500 floats with the weights attributed to each of the 500 tickers in the last observation
+                the weights should add to 1 (ie sum(action) == 1) and be ordered by ticker alphabetically (ie the first weight
+                will be attributed to the first ticker alphabetically)
 
         Returns:
             observation (ObsType): A dataframe in the shape (500, 11) with the 500 top stocks of the S&P 500 on the day and market data on each
@@ -128,14 +186,16 @@ class PortfolioEnv(Env):
             truncated (bool): whether the agent wallet reached 0 (cumulative return over trading period is -100%)
             info (dict): Contains auxiliary diagnostic information (helpful for debugging, learning, and logging)
         """
-        # TODO: handle action
         obs = None
-        reward = 0 # portfolio daily return
         terminated = False
-        truncated = self.wallet <= 0
         try:
             obs = self._next_obs()
         except StopIteration:
             terminated = True
 
+        new_weights = self._validate_action(action)
+        # TODO: handle action
+
+        reward = 0      # portfolio daily return
+        truncated = self.wallet <= 0
         return obs, reward, terminated, truncated, {}
