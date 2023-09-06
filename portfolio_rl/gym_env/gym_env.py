@@ -7,6 +7,7 @@ from gymnasium import Env
 from gymnasium.spaces import Space, Box
 from gymnasium.core import ObsType, ActType
 from gymnasium.envs.registration import EnvSpec
+from gymnasium.utils import seeding
 
 import numpy as np
 from numpy.typing import NDArray
@@ -52,27 +53,19 @@ class MarketObservation(Space):
         return self.df.loc[self.df['date'] == self.dates[pos]]
 
 
-class PortfolioManager:
-    def __init__(self, start_wallet: float):
-        self.df = pd.DataFrame(data={
-            'ticker': ['USD.CASH', 'MTM_VALUE'],
-            'shares': [start_wallet, start_wallet],
-            'notional': [start_wallet, start_wallet],
-            'weight': [1.0, 1.0]
-        }).set_index('ticker')
-
-    @property
-    def mtm_value(self) -> float:
-        return self.df.loc[self.df['ticker'] == 'MTM_VALUE', 'notional'].iloc[0]
-
-
 class RewardType(Enum):
     NOTIONAL = 'notional'
     PERCENT = 'percent'
 
 
 class PortfolioEnv(Env):
-    action_space: Space[ActType]
+    # Possible TODO's:
+    # - add option to short stocks
+    # - calculate long and short carry rates and sum/subtract to wallet
+    # - add option to hedge wallet on index futures
+    # - formalize dataframe format (validate on init) in order to facilitate
+    #   running the environment for other indices
+    action_space: NormBox
     observation_space: Space[ObsType]
     reward_range: Tuple[float, float] = -1, np.inf
     spec: EnvSpec | None = None
@@ -83,7 +76,7 @@ class PortfolioEnv(Env):
     def __init__(self,
         data_path: str, warmup_data_path: Optional[str] = None, start_wallet: float = DEFAULT_WALLET,
         warmup: bool = False, slippage: int = 10, liquidity_limit: float = 0.5,
-        reward_type: RewardType = RewardType.PERCENT
+        reward_type: RewardType = RewardType.PERCENT, seed: Optional[int] = None
     ):
         """
         Portfolio Env constructor
@@ -100,7 +93,15 @@ class PortfolioEnv(Env):
             slippage (optional int): how many bps of slippage to apply to each order (default 10 bps)
             liquidity_limit (optional float): maximum of daily volume that can be traded (default 50%)
             reward_type (optional RewardType): how the reward will be measured, either in notional or percentage
+            seed (optional int): The seed that is used to initialize the environment's PRNG (`np_random`).
+                If the environment does not already have a PRNG and ``seed=None`` (the default option) is passed,
+                a seed will be chosen from some source of entropy (e.g. timestamp or /dev/urandom).
+                However, if the environment already has a PRNG and ``seed=None`` is passed, the PRNG will *not* be reset.
+                If you pass an integer, the PRNG will be reset even if it already exists.
+                Usually, you want to pass an integer *right after the environment has been initialized and then never again*.
+                Please refer to the minimal example above to see this paradigm in action.
         """
+        self.seed = seed
         self.df = pd.read_parquet(data_path)
         self._validate_data(self.df)
         self.warmup = warmup
@@ -115,6 +116,12 @@ class PortfolioEnv(Env):
         self.reward_type = reward_type
         self.action_space = NormBox(0, 1, [1, 500], np.float32)
         self.observation_space = MarketObservation(self.df, shape=[500, 11])
+        self._set_seed(seed)
+
+    def _set_seed(self, seed: Optional[int] = None):
+        self._np_random, _ = seeding.np_random(seed)
+        self.action_space.seed(seed)
+        self.observation_space.seed(seed)
 
     def _validate_data(self, df: pd.DataFrame):
         aux = df.groupby('date').agg({'ticker': 'count'})
@@ -186,23 +193,22 @@ class PortfolioEnv(Env):
         Returns:
             observation (ObsType): Observation of the initial state. This will be an element of :attr:`observation_space`
                 (typically a numpy array) and is analogous to the observation returned by :meth:`step`.
-            info (dictionary):  This dictionary contains auxiliary information complementing ``observation``. It should be analogous to
-                the ``info`` returned by :meth:`step`.
+            info (dictionary): if warmup is true, than the warmup data is returned as a DF in a 'warmup' key
         """
-        super().reset(seed=seed)
+        self._set_seed(seed)
         for attr in ('start_wallet', 'warmup', 'slippage', 'liquidity_limit', 'reward_type'):
             self._set_prop_from_options(options, attr)
 
         self._iterator = None
-        obs = self._next_obs()
+        obs, info = self._next_obs(), {}
         if self.warmup:
-            obs = pd.concat([self.warmup_df, obs]).reset_index(drop=True)
+            info['warmup'] = self.warmup_df
 
         self.wallet = self.start_wallet
         self.historical_wallet_df = pd.DataFrame()
         self.wallet_df = self._base_wallet_df(self.wallet, self.wallet)
         self._update_historical_wallet()
-        return obs, {}
+        return obs, info
 
     def _validate_action(self, action: ActType) -> NDArray[Any]:
         arr = np.array(action)
@@ -223,11 +229,11 @@ class PortfolioEnv(Env):
         ]).reset_index(drop=True)
         self._update_historical_wallet()
 
-    def _calc_reward(self, final_mtm: float, wallet_mtm: float) -> float:
+    def _calc_reward(self, new_mtm: float, previous_mtm: float) -> float:
         if self.reward_type == RewardType.PERCENT:
-            return (final_mtm / wallet_mtm) - 1
+            return (new_mtm / previous_mtm) - 1
         else:
-            return final_mtm - wallet_mtm
+            return new_mtm - previous_mtm
 
     def step(
         self, action: ActType
@@ -320,6 +326,8 @@ class PortfolioEnv(Env):
         df = df.dropna().reset_index(drop=True)
         mean_return = df['return'].mean()
         vol = df['return'].std()
+        # sharpe should take into consideration the risk free rate of return
+        # I may come back to this later
         sharpe = mean_return / vol
         # TODO: calculate max drawdown
         return {
