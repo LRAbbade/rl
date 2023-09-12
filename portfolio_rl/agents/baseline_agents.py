@@ -4,6 +4,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from portfolio_rl.gym_env.gym_env import PortfolioEnv
+from portfolio_rl.utils import simple_normalize
 
 
 class AbstractAgent:
@@ -14,21 +15,24 @@ class AbstractAgent:
         """Implement this if you need to do something with the first observation given by `reset`"""
         pass
 
-    def init(self) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
-        obs, info = self.env.reset()
+    def _init(self, **kwargs) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+        """Calls reset on environment with `kwargs`"""
+        obs, info = self.env.reset(**kwargs)
         self.on_init(obs, info)
         return obs, info
 
     @abstractmethod
-    def step(self, obs: pd.DataFrame, reward: float, terminated: bool, truncated: bool) -> NDArray:
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        """This should be overriden by child classes to define behaviour to be taken at each environment step"""
         raise NotImplementedError('AbstractAgent needs to implement "step" method')
 
-    def run(self) -> tuple[pd.DataFrame, dict[str, str]]:
-        obs, _ = self.init()
+    def run(self, **kwargs) -> tuple[pd.DataFrame, dict[str, str]]:
+        """Runs the environment until termination, `kwargs` are passed to `env.reset`"""
+        obs, _ = self._init(**kwargs)
         reward = 0
         terminated = truncated = False
         while not terminated and not truncated:
-            action = self.step(obs, reward, terminated, truncated)
+            action = self.step(obs, reward)
             obs, reward, terminated, truncated, _ = self.env.step(action)
             print(self.env._cur_date, reward, terminated, truncated)
 
@@ -52,3 +56,20 @@ class RandomWeightedAgent(AbstractAgent):
 
     def step(self, *args, **kwargs) -> NDArray:
         return self.env.action_space.sample(equal_weight=False)
+
+
+class IndexEtfAgent(AbstractAgent):
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        return simple_normalize(obs['weight'].to_numpy())
+
+
+class SingleStockAgent(AbstractAgent):
+    def __init__(self, env: PortfolioEnv, ticker: str):
+        super().__init__(env)
+        self.ticker = ticker
+
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        aux = obs[['ticker', 'weight']]
+        aux.loc[aux['ticker'] == self.ticker, 'weight'] = 1
+        aux.loc[aux['ticker'] != self.ticker, 'weight'] = 0
+        return aux['weight'].to_numpy()

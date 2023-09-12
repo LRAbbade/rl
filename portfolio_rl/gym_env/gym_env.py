@@ -65,6 +65,7 @@ class PortfolioEnv(Env):
     # - add option to hedge wallet on index futures
     # - formalize dataframe format (validate on init) in order to facilitate
     #   running the environment for other indices
+    # - add running free float shares information to data and check it before trades
     action_space: NormBox
     observation_space: Space[ObsType]
     reward_range: Tuple[float, float] = -1, np.inf
@@ -76,7 +77,8 @@ class PortfolioEnv(Env):
     def __init__(self,
         data_path: str, warmup_data_path: Optional[str] = None, start_wallet: float = DEFAULT_WALLET,
         warmup: bool = False, slippage: int = 10, liquidity_limit: float = 0.5,
-        reward_type: RewardType = RewardType.PERCENT, seed: Optional[int] = None
+        reward_type: RewardType = RewardType.PERCENT, seed: Optional[int] = None,
+        fail_threshold: float = 0.1
     ):
         """
         Portfolio Env constructor
@@ -87,7 +89,7 @@ class PortfolioEnv(Env):
                 Each day should have the top 500 stocks in the index that day.
             warmup_data_path (optional str): A parquet file path with warmup data to be given to the agent
                 before trading starts, this is usually to calculate things like moving averages
-            start_wallet (optional float): The size of the trading wallet, 1,000,000 by default
+            start_wallet (optional float): The size of the trading wallet, 10,000,000 by default
             warmup (optional bool): Whether to pass the agent warmup data on `reset` call or not.
                 If `True`, then `warmup_data_path` must resolve to a valid parquet file
             slippage (optional int): how many bps of slippage to apply to each order (default 10 bps)
@@ -100,6 +102,7 @@ class PortfolioEnv(Env):
                 If you pass an integer, the PRNG will be reset even if it already exists.
                 Usually, you want to pass an integer *right after the environment has been initialized and then never again*.
                 Please refer to the minimal example above to see this paradigm in action.
+            fail_threshold (optional float): % of start_wallet to consider run a failure and truncate (default 10%)
         """
         self.seed = seed
         self.df = pd.read_parquet(data_path)
@@ -114,6 +117,7 @@ class PortfolioEnv(Env):
         self.slippage = slippage
         self.liquidity_limit = liquidity_limit
         self.reward_type = reward_type
+        self.fail_threshold = fail_threshold
         self.action_space = NormBox(0, 1, [1, 500], np.float32)
         self.observation_space = MarketObservation(self.df, shape=[500, 11])
         self._set_seed(seed)
@@ -184,11 +188,12 @@ class PortfolioEnv(Env):
                 Usually, you want to pass an integer *right after the environment has been initialized and then never again*.
                 Please refer to the minimal example above to see this paradigm in action.
             options (optional dict):
-                - start_wallet (float): wallet size (default: 1,000,000)
+                - start_wallet (float): wallet size (default: 10,000,000)
                 - warmup (bool): Whether to pass the agent warmup data on `reset` call or not (default: False)
                 - slippage (int): bps of slippage to be applied to each order
                 - liquidity_limit (float): maximum of daily volume that can be traded (default 50%)
                 - reward_type (optional RewardType): how the reward will be measured, either in notional or percentage
+                - fail_threshold (optional float): % of start_wallet to consider run a failure and truncate (default 10%)
 
         Returns:
             observation (ObsType): Observation of the initial state. This will be an element of :attr:`observation_space`
@@ -196,7 +201,7 @@ class PortfolioEnv(Env):
             info (dictionary): if warmup is true, than the warmup data is returned as a DF in a 'warmup' key
         """
         self._set_seed(seed)
-        for attr in ('start_wallet', 'warmup', 'slippage', 'liquidity_limit', 'reward_type'):
+        for attr in ('start_wallet', 'warmup', 'slippage', 'liquidity_limit', 'reward_type', 'fail_threshold'):
             self._set_prop_from_options(options, attr)
 
         self._iterator = None
@@ -213,12 +218,14 @@ class PortfolioEnv(Env):
     def _validate_action(self, action: ActType) -> NDArray[Any]:
         arr = np.array(action)
         assert arr.shape == (500,), f'action shape is {arr.shape}, should be (500,)'
-        assert np.isclose(arr.sum(), 1), f'portfolio weights should sum to 1, not {arr.sum()}'
+        assert arr.sum() <= 1, f'sum of weights should be at most equal to 1, not {arr.sum()}'
+        assert arr.sum() >= 0, f'sum of weights should be bigger than 0, not {arr.sum()}'
         return arr
 
     def _update_wallet(self, previous_obs: pd.DataFrame, cash_left: float, final_mtm: float):
         self.wallet = final_mtm
-        portfolio_wallet = previous_obs[['ticker', 'shares', 'final_notional', 'final_weight']].rename({
+        portfolio_wallet = previous_obs[['ticker', 'shares_new', 'final_notional', 'final_weight']].rename({
+            'shares_new': 'shares',
             'final_notional': 'notional',
             'final_weight': 'weight'
         }, axis=1)
@@ -279,8 +286,6 @@ class PortfolioEnv(Env):
             warnings.warn(f'{len(to_zero)} tickers positions will be zeroed due to having weight 0 in the index')
 
         previous_obs.loc[previous_obs['ticker'].isin(to_zero), 'portfolio_weights'] = 0
-        # rebalance weights to sum to 1
-        previous_obs['portfolio_weights'] = simple_normalize(previous_obs['portfolio_weights'])
         wallet_mtm = self.wallet_df.loc[self.wallet_df['ticker'] == 'MTM_VALUE', 'notional'].iloc[0]
         previous_obs['notional'] = wallet_mtm * previous_obs['portfolio_weights']
         previous_obs['shares'] = (previous_obs['notional'] / previous_obs['close']).map(round_lot)
@@ -291,10 +296,10 @@ class PortfolioEnv(Env):
         previous_obs['shares_old'] = previous_obs['shares_old'].fillna(0)
         previous_obs['diff'] = previous_obs['shares'] - previous_obs['shares_old']
         previous_obs['max_trade_vol'] = previous_obs['volume'] * self.liquidity_limit
-        previous_obs['over_max_volume'] = previous_obs['diff'] > previous_obs['max_trade_vol']
-        vol_restricted_tickers = list(previous_obs.loc[previous_obs['over_max_volume'], 'ticker'])
-        if len(vol_restricted_tickers) > 0:
-            warnings.warn(f'{len(vol_restricted_tickers)} tickers require trades over the daily liquidity limits, will cap trades')
+        previous_obs['over_max_volume'] = abs(previous_obs['diff']) > previous_obs['max_trade_vol']
+        volume_restricted_tickers = list(previous_obs.loc[previous_obs['over_max_volume'], 'ticker'])
+        if len(volume_restricted_tickers) > 0:
+            warnings.warn(f'{len(volume_restricted_tickers)} tickers require trades over the daily liquidity limits, will cap trades')
 
         previous_obs['trade_size'] = abs(previous_obs[['max_trade_vol', 'diff']]).min(axis=1)
         previous_obs['side'] = previous_obs['diff'].map(lambda n: 'buy' if n >= 0 else 'sell')
@@ -312,7 +317,7 @@ class PortfolioEnv(Env):
         self._update_wallet(previous_obs, cash_left, final_mtm)
 
         reward = self._calc_reward(final_mtm, wallet_mtm)
-        truncated = self.wallet <= 0
+        truncated = self.wallet <= self.fail_threshold * self.start_wallet
         return obs, reward, terminated, truncated, {}
 
     def historical_wallet_mtm(self) -> pd.DataFrame:

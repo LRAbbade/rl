@@ -14,3 +14,10 @@ def round_lot(n: float) -> float:
 
 def format_percent(n: float) -> str:
     return f'{100 * n:.2f}%'
+
+
+def calc_cum_return(df, return_col='return', cum_col_name='cum_ret'):
+    df[cum_col_name] = 1
+    df[cum_col_name] += df[return_col]
+    df[cum_col_name] = df[cum_col_name].cumprod()
+    return df
