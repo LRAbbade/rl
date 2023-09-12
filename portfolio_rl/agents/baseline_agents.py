@@ -33,8 +33,8 @@ class AbstractAgent:
         terminated = truncated = False
         while not terminated and not truncated:
             action = self.step(obs, reward)
-            obs, reward, terminated, truncated, _ = self.env.step(action)
-            print(self.env._cur_date, reward, terminated, truncated)
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            print(info['dt'], reward, terminated, truncated)
 
         self.results = self.env.calc_results()
         self.res_df = self.env.historical_wallet_mtm()

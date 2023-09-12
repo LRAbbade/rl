@@ -318,7 +318,7 @@ class PortfolioEnv(Env):
 
         reward = self._calc_reward(final_mtm, wallet_mtm)
         truncated = self.wallet <= self.fail_threshold * self.start_wallet
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, terminated, truncated, {'dt': self._cur_date}
 
     def historical_wallet_mtm(self) -> pd.DataFrame:
         hist_wallet = self.historical_wallet_df
