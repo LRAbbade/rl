@@ -58,6 +58,24 @@ class RandomWeightedAgent(AbstractAgent):
         return self.env.action_space.sample(equal_weight=False)
 
 
+class FixedRandomAgent(AbstractAgent):
+    def __init__(self, env: PortfolioEnv, seed: Optional[int] = None):
+        super().__init__(env)
+        self.set_seed(seed)
+
+    def set_seed(self, seed: Optional[int] = None):
+        self.env._set_seed(seed)
+
+    def on_init(self, obs: pd.DataFrame, info: dict[str, pd.DataFrame]):
+        obs['weight'] = self.env.action_space.sample(equal_weight=False)
+        self.weights = obs[['ticker', 'weight']]
+
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        weights = obs[['ticker']].join(self.weights.set_index('ticker'), on='ticker')
+        weights['weight'] = weights['weight'].fillna(0)
+        return weights['weight'].to_numpy()
+
+
 class IndexEtfAgent(AbstractAgent):
     def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
         return simple_normalize(obs['weight'].to_numpy())
