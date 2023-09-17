@@ -91,3 +91,31 @@ class SingleStockAgent(AbstractAgent):
         aux.loc[aux['ticker'] == self.ticker, 'weight'] = 1
         aux.loc[aux['ticker'] != self.ticker, 'weight'] = 0
         return aux['weight'].to_numpy()
+
+
+class MovingAverageAgent(AbstractAgent):
+    def __init__(self, env: PortfolioEnv, ma_days: int = 50):
+        super().__init__(env)
+        self.ma_days = ma_days
+
+    def _calc_ma(self):
+        self.df['MA'] = self.df.groupby('ticker')['close'].rolling(self.ma_days).mean()\
+            .reset_index().drop('ticker', axis=1).set_index('level_1')['close']
+
+    def on_init(self, obs: pd.DataFrame, info: dict[str, pd.DataFrame]):
+        self.df = info['warmup']
+
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        self.df = pd.concat([self.df, obs]).reset_index(drop=True)
+        self._calc_ma()
+        df = self.df.loc[self.df['date'] == obs['date'].iloc[0], ['weight', 'close', 'MA']]
+        df['signal'] = (df['close'] > df['MA']).map(lambda b: 2 if b else 0.5)
+        df['weight'] *= df['signal']
+        return simple_normalize(df['weight'])
+
+    def run(self, **kwargs) -> tuple[pd.DataFrame, dict[str, str]]:
+        if 'options' not in kwargs:
+            kwargs['options'] = {}
+
+        kwargs['options'].update({'warmup': True})
+        return super().run(**kwargs)
