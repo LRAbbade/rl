@@ -1,7 +1,7 @@
 import warnings
 from datetime import date
 from enum import Enum
-from typing import Optional, Dict, Any, Tuple, SupportsFloat, Iterable
+from typing import Optional, Dict, Any, Tuple, SupportsFloat, Iterable, Union
 
 from gymnasium import Env
 from gymnasium.spaces import Space, Box
@@ -13,8 +13,11 @@ import numpy as np
 from numpy.typing import NDArray
 import pandas as pd
 from sklearn.preprocessing import normalize
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
-from portfolio_rl.utils import round_lot, simple_normalize, format_percent
+from portfolio_rl.utils import calc_cum_return, round_lot, simple_normalize, format_percent
 
 DEFAULT_WALLET = 1e7
 
@@ -218,7 +221,7 @@ class PortfolioEnv(Env):
     def _validate_action(self, action: ActType) -> NDArray[Any]:
         arr = np.array(action)
         assert arr.shape == (500,), f'action shape is {arr.shape}, should be (500,)'
-        assert arr.sum() <= 1, f'sum of weights should be at most equal to 1, not {arr.sum()}'
+        assert np.isclose(arr.sum(), 1) or arr.sum() <= 1, f'sum of weights should be at most equal to 1, not {arr.sum()}'
         assert arr.sum() >= 0, f'sum of weights should be bigger than 0, not {arr.sum()}'
         return arr
 
@@ -241,6 +244,27 @@ class PortfolioEnv(Env):
             return (new_mtm / previous_mtm) - 1
         else:
             return new_mtm - previous_mtm
+
+    def _wallet_day_mtm_value(self, day: date) -> float:
+        return self.historical_wallet_df.loc[
+            (self.historical_wallet_df['date'] == day) &
+            (self.historical_wallet_df['ticker'] == 'MTM_VALUE'),
+            'notional'
+        ].iloc[0]
+
+    def _set_nans_for_tickers_out_of_index(self, df: pd.DataFrame) -> pd.DataFrame:
+        # symbols that were in the composition but are not anymore
+        # need to fill volume, close_new, vwap, and weight
+        # will consider vwap = close_new = close, volume = inf, weight = 0
+        # in order for model to be able to close the position on the ticker
+        # (this is not ideal, but its realistic to assume that anything leaving the S&P 500
+        #  will have a large auction in its last day in the index)
+        out_of_index_mask = df['weight'].isna()
+        df.loc[out_of_index_mask, 'volume'] = np.inf
+        df.loc[out_of_index_mask, 'close_new'] = df.loc[out_of_index_mask, 'close']
+        df.loc[out_of_index_mask, 'vwap'] = df.loc[out_of_index_mask, 'close']
+        df.loc[out_of_index_mask, 'weight'] = 0
+        return df
 
     def step(
         self, action: ActType
@@ -268,7 +292,7 @@ class PortfolioEnv(Env):
         try:
             obs = self._next_obs()
         except StopIteration:
-            return obs, 0, True, False, {}
+            return obs, 0, True, False, {'dt': self._cur_date}
 
         previous_obs = self._day_data(self._last_date)
         weights = self._validate_action(action)
@@ -280,18 +304,16 @@ class PortfolioEnv(Env):
             on='ticker',
             rsuffix='_new'
         )
+        previous_obs = self._set_nans_for_tickers_out_of_index(previous_obs)
         # weight check
         to_zero = list(previous_obs.loc[(previous_obs['weight'] == 0) & (previous_obs['portfolio_weights'] > 0), 'ticker'])
         if len(to_zero) > 0:
             warnings.warn(f'{len(to_zero)} tickers positions will be zeroed due to having weight 0 in the index')
 
         previous_obs.loc[previous_obs['ticker'].isin(to_zero), 'portfolio_weights'] = 0
-        wallet_mtm = self.wallet_df.loc[self.wallet_df['ticker'] == 'MTM_VALUE', 'notional'].iloc[0]
+        wallet_mtm = self._wallet_day_mtm_value(self._last_date)
         previous_obs['notional'] = wallet_mtm * previous_obs['portfolio_weights']
         previous_obs['shares'] = (previous_obs['notional'] / previous_obs['close']).map(round_lot)
-        # TODO: check what happens when tickers that are in the wallet are not in the obs
-        # I think nothing will happen because if it was not in previous_obs, its position would have been zero out
-        # in the last iteration, but need to check regardless
         previous_obs = previous_obs.join(self.wallet_df[['ticker', 'shares']].set_index('ticker'), on='ticker', rsuffix='_old')
         previous_obs['shares_old'] = previous_obs['shares_old'].fillna(0)
         previous_obs['diff'] = previous_obs['shares'] - previous_obs['shares_old']
@@ -341,3 +363,35 @@ class PortfolioEnv(Env):
             'vol': format_percent(vol),
             'sharpe': f'{sharpe:.3f}'
         }
+
+    def plot_mtm(self) -> go.Figure:
+        return px.line(self.historical_wallet_mtm(), x='date', y='notional')
+
+    def _parse_comp_returns(self, df1: pd.DataFrame, df2: pd.DataFrame, df1_value_col: str, df2_value_col: str) -> Union[pd.DataFrame, str, str]:
+        df = df1.join(df2.set_index('date'), on='date')
+        df1_return_col, df2_return_col = f'return_{df1_value_col}', f'return_{df2_value_col}'
+        df1_cum_ret_col, df2_cum_ret_col = f'cum_{df1_return_col}', f'cum_{df2_return_col}'
+        df[df1_return_col] = df[df1_value_col].pct_change()
+        df[df2_return_col] = df[df2_value_col].pct_change()
+        df = calc_cum_return(df, df1_return_col, df1_cum_ret_col)
+        return calc_cum_return(df, df2_return_col, df2_cum_ret_col), df1_cum_ret_col, df2_cum_ret_col
+
+    def _plot_comp(self, df1: pd.DataFrame, df2: pd.DataFrame, df1_value_col: str, df2_value_col: str) -> go.Figure:
+        df, cum_ret_col1, cum_ret_col2 = self._parse_comp_returns(df1, df2, df1_value_col, df2_value_col)
+        fig = make_subplots(specs=[[{'secondary_y': True}]])
+        fig.add_trace(go.Scatter(x=df['date'], y=df[cum_ret_col1], name=f'{df1_value_col} Return'))
+        fig.add_trace(go.Scatter(x=df['date'], y=df[cum_ret_col2], name=f'{df2_value_col} Return'))
+        fig.update_layout(title_text=f'{df1_value_col} X {df2_value_col}')
+        fig.update_xaxes(title_text='Date')
+        fig.update_yaxes(title_text='Return')
+        return fig
+
+    def plot_stock_comp(self, ticker: str) -> go.Figure:
+        wallet_df = self.historical_wallet_mtm()[['date', 'notional']].rename({'notional': 'portfolio'}, axis=1)
+        stock_df = self.df.loc[self.df['ticker'] == ticker, ['date', 'close']].rename({'close': ticker}, axis=1)
+        return self._plot_comp(wallet_df, stock_df, 'portfolio', ticker)
+
+    def index_comp(self, index_parquet_path: str) -> go.Figure:
+        wallet_df = self.historical_wallet_mtm()[['date', 'notional']].rename({'notional': 'portfolio'}, axis=1)
+        spx_df = pd.read_parquet(index_parquet_path)[['date', 'close']].rename({'close': 'SPX'}, axis=1)
+        return self._plot_comp(wallet_df, spx_df, 'portfolio', 'SPX')
