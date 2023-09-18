@@ -124,8 +124,9 @@ class MovingAverageAgent(AbstractAgent):
 
 
 class MeanVarianceAgent(AbstractAgent):
-    def __init__(self, env: PortfolioEnv):
+    def __init__(self, env: PortfolioEnv, cov_days: int = 200):
         super().__init__(env)
+        self.cov_days = cov_days
 
     def on_init(self, obs: pd.DataFrame, info: dict[str, pd.DataFrame]):
         self.df = info['warmup']
@@ -150,7 +151,8 @@ class MeanVarianceAgent(AbstractAgent):
 
     def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
         self.df = pd.concat([self.df, obs]).reset_index(drop=True)
-        df = self.df.pivot(index='date', columns='ticker', values='close')
+        df = self.df.loc[self.df['ticker'].isin(set(obs['ticker']))]
+        df = df.pivot(index='date', columns='ticker', values='close').tail(self.cov_days).ffill()
         df = df.pct_change().dropna(how='all', axis=0)
         optimal_weights = self._calc_weights(df)
         weights = pd.DataFrame(index=df.columns, data={'weights': optimal_weights})
