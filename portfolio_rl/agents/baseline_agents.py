@@ -1,6 +1,8 @@
 from abc import abstractmethod
 from typing import Optional
 import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
 from numpy.typing import NDArray
 
 from portfolio_rl.gym_env.gym_env import PortfolioEnv
@@ -112,6 +114,48 @@ class MovingAverageAgent(AbstractAgent):
         df['signal'] = (df['close'] > df['MA']).map(lambda b: 2 if b else 0.5)
         df['weight'] *= df['signal']
         return simple_normalize(df['weight'])
+
+    def run(self, **kwargs) -> tuple[pd.DataFrame, dict[str, str]]:
+        if 'options' not in kwargs:
+            kwargs['options'] = {}
+
+        kwargs['options'].update({'warmup': True})
+        return super().run(**kwargs)
+
+
+class MeanVarianceAgent(AbstractAgent):
+    def __init__(self, env: PortfolioEnv):
+        super().__init__(env)
+
+    def on_init(self, obs: pd.DataFrame, info: dict[str, pd.DataFrame]):
+        self.df = info['warmup']
+
+    def _calc_weights(self, df: pd.DataFrame) -> NDArray:
+        mean_returns = df.mean()
+        cov_matrix = df.cov()
+
+        def objective(weights): 
+            portfolio_return = np.dot(mean_returns, weights)
+            portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            return -portfolio_return / portfolio_volatility
+
+        solution = minimize(
+            objective,
+            [1 / len(mean_returns) for _ in mean_returns],
+            method='SLSQP',
+            bounds=tuple((0, 1) for _ in range(len(mean_returns))),
+            constraints=({'type': 'eq', 'fun': lambda weights: np.sum(weights) - 1})
+        )
+        return solution.x
+
+    def step(self, obs: pd.DataFrame, reward: float) -> NDArray:
+        self.df = pd.concat([self.df, obs]).reset_index(drop=True)
+        df = self.df.pivot(index='date', columns='ticker', values='close')
+        df = df.pct_change().dropna(how='all', axis=0)
+        optimal_weights = self._calc_weights(df)
+        weights = pd.DataFrame(index=df.columns, data={'weights': optimal_weights})
+        weights = obs[['ticker']].join(weights, on='ticker')
+        return simple_normalize(weights['weights'].fillna(0))
 
     def run(self, **kwargs) -> tuple[pd.DataFrame, dict[str, str]]:
         if 'options' not in kwargs:
