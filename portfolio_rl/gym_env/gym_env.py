@@ -17,7 +17,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
-from portfolio_rl.utils import calc_cum_return, round_lot, simple_normalize, format_percent
+from portfolio_rl.utils import calc_cum_return, round_lot, format_percent
 
 DEFAULT_WALLET = 1e7
 
