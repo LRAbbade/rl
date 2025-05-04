@@ -1,5 +1,6 @@
 FinRL/
 .DS_Store
+anaconda_projects/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
